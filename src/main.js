@@ -179,6 +179,8 @@ const state = {
   transModel: "",
   transLang: "auto",
   uiLang: "auto",
+  activityLevel: 0,
+  activityLast: 0,
 };
 
 // ============ Window controls ============
@@ -442,6 +444,8 @@ function waveLoop() {
   for (let i = 0; i < _waveBuf.length; i++) { const v = (_waveBuf[i] - 128) / 128; sum += v * v; }
   const rms = Math.sqrt(sum / _waveBuf.length);
   const level = state.paused ? 0.04 : Math.min(1, rms * 2.4);
+  state.activityLevel = level;
+  publishRecorderActivity();
   drawWave(level);
   state.rafId = requestAnimationFrame(waveLoop);
 }
@@ -464,6 +468,22 @@ function updateTime() {
   time.querySelector(".t-ss").textContent = ss;
   time.querySelector(".t-ms").textContent = "." + cs;
   if (state.recording) requestAnimationFrame(updateTime);
+}
+
+function recorderElapsed() {
+  return state.elapsedBeforePause + (state.recording && !state.paused ? Date.now() - state.startTs : 0);
+}
+function publishRecorderActivity(force=false) {
+  if (!state.recording) return;
+  const now = Date.now();
+  if (!force && now - state.activityLast < 450) return;
+  state.activityLast = now;
+  invoke('bookos_activity_publish', { appId:'com.bookos.voicerecorder', kind:'recorder', state:{
+    activo: !state.paused, pausado: state.paused,
+    titulo: state.paused ? 'Grabación en pausa' : 'Grabando',
+    subtitulo: 'Grabadora de voz', posicion_ms: Math.round(recorderElapsed()),
+    nivel: state.activityLevel,
+  }}).catch(() => {});
 }
 
 // ============ Recorder ============
@@ -521,6 +541,7 @@ async function startRecording() {
   btnPause.disabled = false; btnCancel.disabled = false;
   $("rec-hint").innerHTML = t("rec.hintRec");
   requestAnimationFrame(updateTime);
+  publishRecorderActivity(true);
 }
 
 function pauseRecording() {
@@ -537,6 +558,7 @@ function pauseRecording() {
     state.elapsedBeforePause += Date.now() - state.startTs;
     setRecState("pause");
   }
+  publishRecorderActivity(true);
 }
 
 let cancelMode = false;
@@ -546,6 +568,7 @@ function stopRecording(cancel = false) {
   if (state.paused) state.elapsedBeforePause; // keep accumulated
   else state.elapsedBeforePause += Date.now() - state.startTs;
   try { state.mediaRecorder.stop(); } catch {}
+  invoke('bookos_activity_close', { appId:'com.bookos.voicerecorder' }).catch(() => {});
 }
 
 async function onRecorderStop() {
@@ -640,6 +663,12 @@ async function runCountdown() {
 btnRec.onclick = () => { state.recording ? stopRecording(false) : startRecording(); };
 btnPause.onclick = pauseRecording;
 btnCancel.onclick = () => stopRecording(true);
+
+window.__TAURI__.event.listen('bookos://activity-action', ({payload}) => {
+  if (payload?.action === 'stop') stopRecording(false);
+  else if ((payload?.action === 'pause' && !state.paused) ||
+           (payload?.action === 'resume' && state.paused)) pauseRecording();
+});
 
 document.addEventListener("keydown", (e) => {
   if (e.target.matches("input, textarea, [contenteditable]")) return;

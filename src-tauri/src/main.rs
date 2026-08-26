@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod bookos_activity;
+
 use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -435,9 +437,12 @@ fn main() {
             delete_recording, rename_recording, reveal_in_files,
             get_meta, set_favorite, set_tags, set_transcript, set_notes,
             list_transcribe_engines, transcribe, pick_model_file,
+            bookos_activity::bookos_activity_publish,
+            bookos_activity::bookos_activity_close,
         ])
         .setup(|app| {
             use tauri::Manager;
+            bookos_activity::listen(app.handle().clone(), "com.bookos.voicerecorder");
             install_media_permission(app);
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.show();
