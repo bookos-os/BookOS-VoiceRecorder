@@ -22,6 +22,9 @@ futures-util = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = "2.0"
+# Para apagar el zoom por pellizco de WebKitGTK (ver main.rs). Misma versión que
+# ya arrastra tauri.
+gtk = "0.18"
 
 [features]
 default = ["custom-protocol"]

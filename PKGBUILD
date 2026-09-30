@@ -21,7 +21,8 @@ package() {
 
   install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/bookos-voicerecorder.desktop" <<EOF
 [Desktop Entry]
-Name=Bookos Voice Recorder
+Name=Voice Recorder
+Name[es]=Grabadora
 Comment=Grabador de voz BookOS
 Exec=bookos-voicerecorder
 Icon=bookos-voicerecorder

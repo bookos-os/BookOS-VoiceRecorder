@@ -85,8 +85,48 @@ fn save_state(state: serde_json::Value) -> Result<(), String> {
     atomic_write(&state_path(), s.as_bytes())
 }
 
+/// El tema del escritorio, preguntado al portal XDG.
+///
+/// Va **antes** que `kreadconfig6`: esa orden solo sabe de Plasma y lee el
+/// `kdeglobals` del usuario, que en una sesión BookOS no lo escribe nadie —el
+/// tema se elige en la tarjeta de Apariencia y vive en `panel.conf`—, así que
+/// la app se quedaba con el tema con el que se instaló el sistema. El portal
+/// lo sirve la sesión que esté corriendo: BookOS desde el propio compositor,
+/// y Plasma y GNOME también, de modo que esto funciona en las tres.
+///
+/// `color-scheme`: 1 oscuro, 2 claro, 0 sin preferencia. `gdbus` viene con
+/// GLib, que ya es dependencia de cualquier app Tauri: no añade nada.
+fn portal_color_scheme() -> Option<String> {
+    let salida = std::process::Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.freedesktop.portal.Desktop",
+            "--object-path",
+            "/org/freedesktop/portal/desktop",
+            "--method",
+            "org.freedesktop.portal.Settings.ReadOne",
+            "org.freedesktop.appearance",
+            "color-scheme",
+        ])
+        .output()
+        .ok()?;
+    // Contesta «(<uint32 1>,)»; el 0 es «sin preferencia» y no es respuesta.
+    let texto = String::from_utf8_lossy(&salida.stdout);
+    let n = texto.split("uint32").nth(1)?.trim_start().chars().next()?;
+    match n {
+        '1' => Some("dark".to_string()),
+        '2' => Some("light".to_string()),
+        _ => None,
+    }
+}
+
 #[tauri::command]
 fn detect_system_theme() -> String {
+    if let Some(tema) = portal_color_scheme() {
+        return tema;
+    }
     let kde_attempts = [
         ("kreadconfig6", &["--group", "General", "--key", "ColorScheme"][..]),
         ("kreadconfig5", &["--group", "General", "--key", "ColorScheme"][..]),
@@ -108,6 +148,14 @@ fn detect_system_theme() -> String {
 
 #[tauri::command]
 fn get_recordings_dir() -> String { recordings_dir().to_string_lossy().into_owned() }
+
+#[tauri::command]
+fn bookos_palette_css() -> String {
+    std::env::var("HOME").ok()
+        .map(|h| std::path::Path::new(&h).join(".config/bookos/palette.css"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default()
+}
 
 #[derive(Serialize)]
 struct RecMeta {
@@ -367,11 +415,13 @@ fn transcribe(path: String, engine: String, model_path: String, language: String
             if model_path.trim().is_empty() {
                 return Err("Selecciona ruta de modelo Vosk en ajustes".into());
             }
-            let script = format!(
+            // Las rutas van por sys.argv y no dentro del código: un nombre de
+            // archivo con una comilla ejecutaba Python arbitrario.
+            let script =
                 "import sys, json, wave\n\
                  from vosk import Model, KaldiRecognizer\n\
-                 m = Model(r'{model}')\n\
-                 wf = wave.open(r'{wav}','rb')\n\
+                 m = Model(sys.argv[1])\n\
+                 wf = wave.open(sys.argv[2],'rb')\n\
                  rec = KaldiRecognizer(m, wf.getframerate())\n\
                  rec.SetWords(False)\n\
                  out=[]\n\
@@ -381,10 +431,8 @@ fn transcribe(path: String, engine: String, model_path: String, language: String
                   if rec.AcceptWaveform(d):\n\
                    out.append(json.loads(rec.Result()).get('text',''))\n\
                  out.append(json.loads(rec.FinalResult()).get('text',''))\n\
-                 print('\\n'.join([x for x in out if x]))",
-                model = model_path, wav = wav.to_string_lossy()
-            );
-            let out = Command::new("python3").arg("-c").arg(&script).output()
+                 print('\\n'.join([x for x in out if x]))";
+            let out = Command::new("python3").arg("-c").arg(script).arg(&model_path).arg(&wav).output()
                 .map_err(|e| format!("python3 -m vosk: {}", e))?;
             if !out.status.success() {
                 return Err(format!("vosk-py fallo: {}", String::from_utf8_lossy(&out.stderr)));
@@ -405,7 +453,7 @@ fn pick_model_file() -> Option<String> { None } // dialog handled in JS
 #[cfg(target_os = "linux")]
 fn install_media_permission(app: &tauri::App) {
     use tauri::Manager;
-    use webkit2gtk::{WebViewExt, SettingsExt};
+    use webkit2gtk::{glib::ObjectExt, PermissionRequestExt, SettingsExt, WebViewExt};
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.with_webview(|webview| {
             let wv: webkit2gtk::WebView = webview.inner();
@@ -414,25 +462,58 @@ fn install_media_permission(app: &tauri::App) {
                 s.set_enable_mediasource(true);
                 s.set_enable_webaudio(true);
             }
-            // NOTE: do NOT connect_permission_request — having any listener
-            // freezes click handling on some WebKit2GTK builds. With the
-            // settings above plus the JS calling getUserMedia, WebKit will
-            // grant access automatically for local content.
+            wv.connect_permission_request(|_, request| {
+                if !request.is::<webkit2gtk::UserMediaPermissionRequest>() {
+                    return false;
+                }
+                let request = request.clone();
+                gtk::glib::idle_add_local_once(move || request.allow());
+                true
+            });
         });
     }
 }
 #[cfg(not(target_os = "linux"))]
 fn install_media_permission(_app: &tauri::App) {}
 
+/// Quita el zoom de página que WebKitGTK hace con el pellizco del touchpad.
+///
+/// No hay ajuste para eso ni en WebKit ni en Tauri, y la página no se entera:
+/// el pellizco lo consume un `GtkGestureZoom` de la propia vista y llega como
+/// `setMagnification`, no como `wheel` ni `touch*`, así que ningún
+/// `preventDefault` lo frena. Se apaga ese gesto y ningún otro: con fase `None`
+/// GTK deja de pasarle eventos (gtkeventcontroller.c, 3.24). Va en
+/// `on_page_load` para cubrir también las ventanas que se abran después.
+fn desactivar_zoom_por_pellizco<R: tauri::Runtime>(
+    webview: &tauri::Webview<R>,
+    _: &tauri::webview::PageLoadPayload<'_>,
+) {
+    #[cfg(target_os = "linux")]
+    let _ = webview.with_webview(|webview| {
+        use gtk::glib::translate::from_glib_none;
+        use gtk::prelude::*;
+
+        // WebKitGTK guarda ahí el gesto (WebKitWebViewBase.cpp, 2.52.5). No es
+        // API pública: si la clave cambia, no se encuentra y el zoom vuelve.
+        // Lo guardado es un puntero C a un GObject, no un tipo de Rust.
+        let Some(gesto) = (unsafe { webview.inner().data::<gtk::ffi::GtkGesture>("wk-view-zoom-gesture") }) else {
+            return;
+        };
+        let gesto: gtk::Gesture = unsafe { from_glib_none(gesto.as_ptr()) };
+        gesto.set_propagation_phase(gtk::PropagationPhase::None);
+    });
+}
+
 fn main() {
     let initial_meta = load_meta_map();
     tauri::Builder::default()
+        .on_page_load(desactivar_zoom_por_pellizco)
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .manage(MetaStore(Mutex::new(initial_meta)))
         .invoke_handler(tauri::generate_handler![
             load_state, save_state, detect_system_theme,
-            get_recordings_dir, list_recordings,
+            get_recordings_dir, bookos_palette_css, list_recordings,
             save_recording, read_recording_b64,
             delete_recording, rename_recording, reveal_in_files,
             get_meta, set_favorite, set_tags, set_transcript, set_notes,

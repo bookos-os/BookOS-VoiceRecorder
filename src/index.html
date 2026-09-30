@@ -4,16 +4,17 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,minimum-scale=1.0,user-scalable=no">
 <link rel="stylesheet" href="style.css">
+<script src="bookos-palette.js"></script>
 <title>Grabador de voz</title>
 </head>
 <body>
 <div class="main-container windowed" id="mc">
 
   <div class="titlebar" data-tauri-drag-region>
-    <div class="tb-left">
+    <div class="tb-left" data-tauri-drag-region>
       <span class="tb-title" id="tb-title" data-i18n="app.title">Grabador de voz</span>
     </div>
-    <div class="tb-center"></div>
+    <div class="tb-center" data-tauri-drag-region></div>
     <div class="tb-right">
       <button id="open-folder-btn" class="tb-icon-btn" data-i18n-title="tb.folder" title="Abrir carpeta de grabaciones" aria-label="Carpeta">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.25 12.75V12A2.25 2.25 0 0 1 4.5 9.75h15A2.25 2.25 0 0 1 21.75 12v.75m-8.69-6.44-2.12-2.12a1.5 1.5 0 0 0-1.061-.44H4.5A2.25 2.25 0 0 0 2.25 6v12a2.25 2.25 0 0 0 2.25 2.25h15A2.25 2.25 0 0 0 21.75 18V9a2.25 2.25 0 0 0-2.25-2.25h-5.379a1.5 1.5 0 0 1-1.06-.44Z"/></svg>
@@ -44,10 +45,19 @@
     <div class="page page-rec" id="page-rec">
       <div class="rec-layout">
 
+        <button class="sb-expand-btn hidden" id="sb-expand-btn" data-i18n-title="sb.expand" title="Mostrar grabaciones">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5.25 4.5v15m13.5-7.5-4.5-4.5m4.5 4.5-4.5 4.5"/></svg>
+        </button>
+
         <aside class="rec-sidebar" id="rec-sidebar">
           <div class="sb-head">
             <div class="sb-title" data-i18n="sb.title">Grabaciones</div>
-            <div class="sb-count" id="sb-count">0</div>
+            <div class="sb-head-right">
+              <div class="sb-count" id="sb-count">0</div>
+              <button id="sb-collapse-btn" class="sb-collapse-btn" data-i18n-title="sb.collapse" title="Ocultar panel">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.75 4.5v15m-13.5-7.5 4.5-4.5m-4.5 4.5 4.5 4.5"/></svg>
+              </button>
+            </div>
           </div>
           <div class="sb-search-wrap">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21 21-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607Z"/></svg>

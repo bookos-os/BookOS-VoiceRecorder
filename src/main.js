@@ -13,6 +13,7 @@ const I18N = {
     "tb.theme":"Cambiar tema",
     "wm.minimize":"Minimizar","wm.maximize":"Maximizar","wm.close":"Cerrar",
     "sb.title":"Grabaciones",
+    "sb.collapse":"Ocultar panel","sb.expand":"Mostrar grabaciones",
     "sb.search":"Buscar nombre o #tag…",
     "sb.all":"Todas","sb.fav":"Favoritas",
     "sb.empty.t":"Sin grabaciones",
@@ -73,6 +74,7 @@ const I18N = {
     "tb.theme":"Change theme",
     "wm.minimize":"Minimize","wm.maximize":"Maximize","wm.close":"Close",
     "sb.title":"Recordings",
+    "sb.collapse":"Hide panel","sb.expand":"Show recordings",
     "sb.search":"Search name or #tag…",
     "sb.all":"All","sb.fav":"Favorites",
     "sb.empty.t":"No recordings",
@@ -179,6 +181,7 @@ const state = {
   transModel: "",
   transLang: "auto",
   uiLang: "auto",
+  sidebarCollapsed: false,
   activityLevel: 0,
   activityLast: 0,
 };
@@ -260,6 +263,12 @@ $("settings-btn").onclick = async () => {
   showPage("settings");
   try { $("rec-dir-path").textContent = await invoke("get_recordings_dir"); } catch {}
 };
+function applySidebarUI() {
+  $("rec-sidebar").classList.toggle("collapsed", state.sidebarCollapsed);
+  $("sb-expand-btn").classList.toggle("hidden", !state.sidebarCollapsed);
+}
+$("sb-collapse-btn").onclick = async () => { state.sidebarCollapsed = true; applySidebarUI(); await persistState(); };
+$("sb-expand-btn").onclick = async () => { state.sidebarCollapsed = false; applySidebarUI(); await persistState(); };
 $("open-folder-btn").onclick = openRecordingsFolder;
 $("open-folder-row").onclick = openRecordingsFolder;
 async function openRecordingsFolder() {
@@ -303,6 +312,7 @@ async function persistState() {
         transModel: state.transModel,
         transLang: state.transLang,
         uiLang: state.uiLang,
+        sidebarCollapsed: state.sidebarCollapsed,
       }
     }});
   } catch {}
@@ -322,6 +332,7 @@ async function loadState() {
     if (cfg.transModel) state.transModel = cfg.transModel;
     if (cfg.transLang) state.transLang = cfg.transLang;
     if (cfg.uiLang) state.uiLang = cfg.uiLang;
+    state.sidebarCollapsed = !!cfg.sidebarCollapsed;
   } catch {}
   CUR_LANG = state.uiLang === "auto" ? detectLang() : state.uiLang;
   applyI18n();
@@ -333,6 +344,7 @@ async function loadState() {
   $("ts-lang").value = state.transLang || "auto";
   applySpeedUI();
   applyLoopUI();
+  applySidebarUI();
   $("ui-lang").onchange = async () => {
     state.uiLang = $("ui-lang").value;
     CUR_LANG = state.uiLang === "auto" ? detectLang() : state.uiLang;
@@ -573,6 +585,10 @@ function stopRecording(cancel = false) {
 
 async function onRecorderStop() {
   state.recording = false; state.paused = false;
+  // Otra vez aquí y no solo en stopRecording: entre stop() y este evento
+  // `waveLoop` sigue viendo `recording` y republica, y esa publicación llegaba
+  // después del cierre y dejaba la isla en «Grabando» para siempre.
+  invoke('bookos_activity_close', { appId:'com.bookos.voicerecorder' }).catch(() => {});
   setRecState("idle");
   btnPause.disabled = true; btnCancel.disabled = true;
   $("rec-hint").innerHTML = t("rec.hintIdle");
