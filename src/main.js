@@ -2,6 +2,48 @@
 const invoke = (cmd, args) => window.__TAURI__.core.invoke(cmd, args);
 const win = () => window.__TAURI__.window.getCurrentWindow();
 
+// El idioma y el tema se eligen en Ajustes de BookOS, no por ventana.
+for (const id of ["theme-btn", "lang-btn"]) {
+  const control = document.getElementById(id);
+  if (control) control.hidden = true;
+}
+for (const id of ["ui-lang", "seg-theme"]) {
+  const control = document.getElementById(id);
+  control?.closest(".detail-item")?.remove();
+}
+const selectorTema = document.getElementById("themePicker")?.closest(".settings-row");
+if (selectorTema) selectorTema.hidden = true;
+
+
+
+// Selector de archivos: el explorador de BookOS (AI-DESIGN-SYSTEM §9). Toma las
+// opciones de `dialog.open/save` de Tauri para que, si el explorador no está
+// instalado, pasen tal cual al diálogo de siempre.
+async function elegirRuta(modo, opciones = {}) {
+  const filtros = opciones.filters || [];
+  const exts = filtros.flatMap(f => f.extensions);
+  // Un filtro «*» es «todo»; el explorador solo aplica uno, la unión del resto.
+  const patrones = exts.includes('*') ? [] : exts.map(e => '*.' + e);
+  const ruta = opciones.defaultPath || '';
+  const corte = ruta.lastIndexOf('/');
+  try {
+    const rutas = await window.__TAURI__.core.invoke('elegir_ruta', { eleccion: {
+      modo: opciones.directory ? 'folder' : modo,
+      multiple: !!opciones.multiple,
+      patrones,
+      nombreFiltro: filtros.length === 1 ? filtros[0].name : undefined,
+      titulo: opciones.title,
+      nombre: modo === 'save' && ruta ? ruta.slice(corte + 1) : undefined,
+      inicio: corte > 0 ? ruta.slice(0, corte) : undefined,
+    } });
+    if (!rutas) return null;
+    return opciones.multiple ? rutas : rutas[0];
+  } catch (e) {
+    if (e !== 'sin-explorador') throw e;
+    return window.__TAURI__.dialog[modo](opciones);
+  }
+}
+
 // ============ i18n ============
 const I18N = {
   es: {
@@ -334,9 +376,12 @@ async function loadState() {
     if (cfg.uiLang) state.uiLang = cfg.uiLang;
     state.sidebarCollapsed = !!cfg.sidebarCollapsed;
   } catch {}
-  CUR_LANG = state.uiLang === "auto" ? detectLang() : state.uiLang;
+  state.uiLang = await invoke("bookos_language").catch(() => "es");
+  CUR_LANG = state.uiLang;
   applyI18n();
+  state.theme = 'auto';
   await applyTheme(state.theme);
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { if (state.theme === 'auto') applyTheme('auto'); });
   const ul = $("ui-lang"); if (ul) ul.value = state.uiLang;
   document.querySelectorAll('#seg-quality button').forEach(b => b.classList.toggle("on", b.dataset.v === state.quality));
   $("tg-autosave").classList.toggle("active", state.autosave);
@@ -620,25 +665,15 @@ function autoName() {
 }
 
 async function saveBlob(blob, ext, name, durMs) {
-  const buf = await blob.arrayBuffer();
-  const b64 = arrayBufferToBase64(buf);
   try {
-    const path = await invoke("save_recording", { name, ext, dataB64: b64 });
+    // El audio va como cuerpo binario, no en base64 (ver save_recording en main.rs).
+    const path = await window.__TAURI__.core.invoke("save_recording", await blob.arrayBuffer(),
+      { headers: { nombre: encodeURIComponent(name), ext } });
     toast(t("toast.saved", { d: fmtDuration(durMs) }));
     await refreshList();
     const item = state.recordings.find(r => r.path === path);
     if (item) selectRecording(item);
   } catch (e) { toast(t("toast.err", { m: e })); }
-}
-
-function arrayBufferToBase64(buf) {
-  const bytes = new Uint8Array(buf);
-  let bin = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
-  }
-  return btoa(bin);
 }
 
 // ============ Save modal ============
@@ -783,8 +818,7 @@ async function selectRecording(r) {
   audio.loop = state.loop;
   audio.playbackRate = state.speed;
   try {
-    const b64 = await invoke("read_recording_b64", { path: r.path });
-    const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+    const bytes = await invoke("read_recording", { path: r.path });
     const blob = new Blob([bytes], { type: r.ext === "wav" ? "audio/wav" : r.ext === "mp3" ? "audio/mp3" : r.ext === "ogg" ? "audio/ogg" : "audio/webm" });
     if (audio.src) URL.revokeObjectURL(audio.src);
     audio.src = URL.createObjectURL(blob);
@@ -899,8 +933,7 @@ function refreshModelUI() {
   $("ts-model-clear").style.display = has ? "" : "none";
 }
 $("ts-model-row").onclick = async () => {
-  const { open } = window.__TAURI__.dialog;
-  const p = await open({ filters: [{ name: "Modelo", extensions: ["bin", "*"] }] });
+  const p = await elegirRuta('open', { filters: [{ name: "Modelo", extensions: ["bin", "*"] }] });
   if (!p) return;
   state.transModel = p;
   await persistState();
@@ -999,15 +1032,13 @@ $("pl-reveal").onclick = async () => {
 };
 $("pl-export").onclick = async () => {
   if (!state.selected) return;
-  const { save } = window.__TAURI__.dialog;
   const r = state.selected;
-  const dest = await save({ defaultPath: r.name + "." + r.ext, filters: [{ name: "Audio", extensions: [r.ext] }] });
+  const dest = await elegirRuta('save', { defaultPath: r.name + "." + r.ext, filters: [{ name: "Audio", extensions: [r.ext] }] });
   if (!dest) return;
   try {
-    const b64 = await invoke("read_recording_b64", { path: r.path });
+    const bytes = await invoke("read_recording", { path: r.path });
     const { writeFile } = window.__TAURI__.fs;
-    const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-    await writeFile(dest, bytes);
+    await writeFile(dest, new Uint8Array(bytes));
     toast(t("toast.exported"));
   } catch (e) { toast(t("toast.err", { m: e })); }
 };

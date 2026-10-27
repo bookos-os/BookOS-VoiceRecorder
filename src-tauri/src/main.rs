@@ -2,7 +2,6 @@
 
 mod bookos_activity;
 
-use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -237,9 +236,22 @@ fn set_notes(path: String, text: String, store: tauri::State<'_, MetaStore>) -> 
     save_meta_map(&m)
 }
 
+fn cabecera<'a>(peticion: &'a tauri::ipc::Request<'_>, clave: &str) -> &'a str {
+    peticion.headers().get(clave).and_then(|v| v.to_str().ok()).unwrap_or_default()
+}
+
+/// El audio llega como cuerpo binario de la petición y no como un argumento
+/// en base64: así no hay copias de más (texto binario y base64 en la página,
+/// base64 y decodificado aquí), que con una grabación de una hora eran cientos
+/// de MB. El nombre y la extensión van en cabeceras; el nombre, con
+/// `encodeURIComponent`, porque una cabecera no admite tildes.
 #[tauri::command]
-fn save_recording(name: String, ext: String, data_b64: String) -> Result<String, String> {
-    let bytes = general_purpose::STANDARD.decode(&data_b64).map_err(|e| e.to_string())?;
+fn save_recording(request: tauri::ipc::Request<'_>) -> Result<String, String> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("save_recording espera el audio como cuerpo binario".into());
+    };
+    let name = percent_encoding::percent_decode_str(cabecera(&request, "nombre")).decode_utf8_lossy();
+    let ext = cabecera(&request, "ext");
     let safe_name: String = name.chars().map(|c| if "/\\:*?\"<>|".contains(c) { '_' } else { c }).collect();
     let safe_name = if safe_name.trim().is_empty() { "Grabacion".into() } else { safe_name };
     let safe_ext: String = ext.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
@@ -250,18 +262,21 @@ fn save_recording(name: String, ext: String, data_b64: String) -> Result<String,
     while p.exists() {
         p.pop(); p.push(format!("{} ({}).{}", safe_name, i, safe_ext)); i += 1;
     }
-    atomic_write(&p, &bytes)?;
+    atomic_write(&p, bytes)?;
     Ok(p.to_string_lossy().into_owned())
 }
 
+/// Devuelve los bytes tal cual (la página recibe un `ArrayBuffer`). En base64,
+/// abrir una grabación de 19 MB subía el árbol de procesos de 126 MB a un pico
+/// de ~600 MB y lo dejaba en 200–285 MB; así, pico de ~255 MB y ~175 MB, y
+/// tarda 0,4 s en vez de 1,4 s (5 s sin JIT, por el `atob` byte a byte).
 #[tauri::command]
-fn read_recording_b64(path: String) -> Result<String, String> {
+fn read_recording(path: String) -> Result<tauri::ipc::Response, String> {
     // Solo se permite leer archivos dentro de la carpeta de grabaciones: `path`
     // viene del frontend y sin esta comprobación sería una lectura arbitraria de
     // archivos (p. ej. ~/.ssh/id_rsa) si el webview llega a comprometerse.
     let canon = check_in_recordings(&PathBuf::from(&path))?;
-    let bytes = fs::read(&canon).map_err(|e| e.to_string())?;
-    Ok(general_purpose::STANDARD.encode(&bytes))
+    fs::read(&canon).map(tauri::ipc::Response::new).map_err(|e| e.to_string())
 }
 
 fn check_in_recordings(p: &PathBuf) -> Result<PathBuf, String> {
@@ -504,7 +519,117 @@ fn desactivar_zoom_por_pellizco<R: tauri::Runtime>(
     });
 }
 
+/// Qué quiere elegir el frontend. Cada campo es una bandera `--pick-*` de
+/// `bookos-explorer`.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Eleccion {
+    modo: ModoEleccion,
+    #[serde(default)]
+    multiple: bool,
+    #[serde(default)]
+    patrones: Vec<String>,
+    nombre_filtro: Option<String>,
+    titulo: Option<String>,
+    nombre: Option<String>,
+    inicio: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ModoEleccion {
+    Open,
+    Save,
+    Folder,
+}
+
+/// Selector de archivos del sistema: `bookos-explorer` en modo portal
+/// (AI-DESIGN-SYSTEM §9), nunca el diálogo de GTK. `None` es que el usuario
+/// canceló. Sin el explorador instalado devuelve el error `sin-explorador` y
+/// el frontend cae al diálogo de Tauri.
+#[tauri::command]
+async fn elegir_ruta(eleccion: Eleccion) -> Result<Option<Vec<String>>, String> {
+    let salida = std::env::temp_dir().join(format!(
+        "{}-pick-{}-{}.txt",
+        env!("CARGO_PKG_NAME"),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_nanos()
+    ));
+    let mut orden = std::process::Command::new("bookos-explorer");
+    orden.arg("--bookos-portal").arg(&salida).arg("--pick-mode").arg(match eleccion.modo {
+        ModoEleccion::Open => "open",
+        ModoEleccion::Save => "save",
+        ModoEleccion::Folder => "folder",
+    });
+    if eleccion.multiple {
+        orden.arg("--pick-multiple");
+    }
+    for patron in &eleccion.patrones {
+        orden.arg("--pick-pattern").arg(patron);
+    }
+    for (bandera, valor) in [
+        ("--pick-filter-name", &eleccion.nombre_filtro),
+        ("--pick-title", &eleccion.titulo),
+        ("--pick-name", &eleccion.nombre),
+        ("--pick-start", &eleccion.inicio),
+    ] {
+        if let Some(valor) = valor {
+            orden.arg(bandera).arg(valor);
+        }
+    }
+    let mut hijo = match orden.spawn() {
+        Ok(hijo) => hijo,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err("sin-explorador".into()),
+        Err(e) => return Err(e.to_string()),
+    };
+    // Se espera a que el explorador salga y solo entonces se lee: escribe el
+    // fichero justo antes de `exit`, y leerlo en cuanto aparece (lo que hace
+    // el Viewer) puede pillarlo vacío y tomarlo por una cancelación. Es lo
+    // mismo que hace el portal del compositor.
+    tauri::async_runtime::spawn_blocking(move || {
+        let fin = hijo.wait();
+        let texto = std::fs::read_to_string(&salida);
+        // Sin fichero es que se canceló: no hay nada que borrar.
+        let _ = std::fs::remove_file(&salida);
+        fin.map_err(|e| e.to_string())?;
+        let rutas: Vec<String> = texto.unwrap_or_default().lines().map(str::to_owned).collect();
+        Ok((!rutas.is_empty()).then_some(rutas))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn bookos_language() -> String {
+    let locale = std::env::var("LANG").unwrap_or_else(|_| "en".into());
+    let Some(home) = std::env::var_os("HOME") else {
+        return if locale.to_lowercase().starts_with("es") { "es" } else { "en" }.into();
+    };
+    let path = std::path::PathBuf::from(home).join(".config/bookos/settings.json");
+    let language = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .and_then(|settings| settings.get("AppLanguage").and_then(|value| value.as_str()).map(str::to_owned));
+    match language.as_deref() {
+        Some("es") => "es".into(),
+        Some("en") => "en".into(),
+        _ if locale.to_lowercase().starts_with("es") => "es".into(),
+        _ => "en".into(),
+    }
+}
+
 fn main() {
+    // El JavaScript de la app pinta una onda y mueve listas: con el intérprete
+    // sobra. Sin JIT, 126 MB → 121 MB en reposo (PSS de los tres procesos,
+    // WebKitGTK 2.54.1). DMABUF se deja activo: quitarlo ahorra otros 10 MB,
+    // pero copia cada frame por memoria compartida y la onda se anima a 60 Hz
+    // (mismo motivo que en BookOS-Settings).
+    if std::env::var_os("JSC_useJIT").is_none() {
+        std::env::set_var("JSC_useJIT", "0");
+    }
     let initial_meta = load_meta_map();
     tauri::Builder::default()
         .on_page_load(desactivar_zoom_por_pellizco)
@@ -512,9 +637,11 @@ fn main() {
         .plugin(tauri_plugin_fs::init())
         .manage(MetaStore(Mutex::new(initial_meta)))
         .invoke_handler(tauri::generate_handler![
+            elegir_ruta,
+            bookos_language,
             load_state, save_state, detect_system_theme,
             get_recordings_dir, bookos_palette_css, list_recordings,
-            save_recording, read_recording_b64,
+            save_recording, read_recording,
             delete_recording, rename_recording, reveal_in_files,
             get_meta, set_favorite, set_tags, set_transcript, set_notes,
             list_transcribe_engines, transcribe, pick_model_file,
